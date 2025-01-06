@@ -155,7 +155,7 @@ import torch
 
 import triton
 import triton.language as tl
-from ..utils import is_cuda, is_hip_mi200, DEVICE 
+from utils import is_cuda, DEVICE 
 
 
 

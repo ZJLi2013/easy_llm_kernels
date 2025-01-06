@@ -15,13 +15,36 @@ workable triton kernels for llm inference
 
 
 
+## test bench 
 
-* how to run 
+* on H20
 
 ```sh
-python -m benchmark.bench_matmul
-python -m unit_test.test_matmul
-``` 
+# 0. launch image 
+docker run --gpus all --rm -it -v /home/david/kernels/llm_triton_kernels:/workspace/llm_triton_kernels -w /workspace  nvcr.io/nvidia/pytorch:24.11-py3
+
+cd /workspace/llm_triton_kernels 
+
+export PYTHONPATH=$(pwd):$PYTHONPATH
+
+# 1. unit test 
+python3 unit_test/test_matmul.py 
+
+# 2. bench perf 
+python3 benchmarks/bench_matmul.py 
+
+
+
+```
+
+
+
+
+
+
+
+
+
 
 
 

@@ -1,7 +1,7 @@
 import triton 
+import torch 
 
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+DEVICE = torch.cuda.current_device()
 
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"

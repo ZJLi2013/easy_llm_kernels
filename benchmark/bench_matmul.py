@@ -10,7 +10,8 @@
 
 import torch 
 import triton 
-from ..utils import is_cuda, is_hip_mi200, DEVICE 
+from kernels import matmul 
+from utils import is_cuda, DEVICE 
 
 TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
 ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
