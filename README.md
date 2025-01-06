@@ -22,20 +22,18 @@ workable triton kernels for llm inference
 ```sh
 # 0. launch image 
 docker run --gpus all --rm -it -v /home/david/kernels/llm_triton_kernels:/workspace/llm_triton_kernels -w /workspace  nvcr.io/nvidia/pytorch:24.11-py3
-
 cd /workspace/llm_triton_kernels 
-
 export PYTHONPATH=$(pwd):$PYTHONPATH
-
 # 1. unit test 
 python3 unit_test/test_matmul.py 
-
+python3 unit_test/test_fusedattn.py 
 # 2. bench perf 
-python3 benchmarks/bench_matmul.py 
-
+python3 benchmark/bench_matmul.py 
+python3 benchmark/bench_fusedattn.py
 
 
 ```
+
 
 
 
