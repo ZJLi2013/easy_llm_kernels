@@ -1,22 +1,9 @@
 import triton 
 import triton.language as tl 
+import torch 
+from typing import Optional, Tuple, Dict 
+import functools 
 
-# We don't run auto-tuning every time to keep the tutorial fast. Keeping
-# the code below and commenting out the equivalent parameters is convenient for
-# re-tuning.
-configs = [
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}),   
-]
-
-def keep(conf):
-    BLOCK_M = conf.kwargs["BLOCK_SIZE_M"]
-    BLOCK_N = conf.kwargs["BLBLOCK_SIZE_NOCK_N"]
-    if BLOCK_M * BLOCK_N < 64 * 64 :
-        return False
-    return True
-
-# TODO
-# @triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def fused_moe_kernel(
         # Pointers to matrices
@@ -128,6 +115,7 @@ def fused_moe_kernel(
         b_scale = tl.load(b_scale_ptrs)
 
     if use_fp8_w8a8:
+        # TODO: add support for block-level fp8 quant, used in ds-v3 
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
@@ -198,3 +186,354 @@ def fused_moe_kernel(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
+def fused_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], (
+        "Number of tokens mismatch")
+
+    M, _ = hidden_states.shape
+
+    topk_weights = torch.empty(M,
+                               topk,
+                               dtype=torch.float32,
+                               device=hidden_states.device)
+    topk_ids = torch.empty(M,
+                           topk,
+                           dtype=torch.int32,
+                           device=hidden_states.device)
+    token_expert_indicies = torch.empty(M,
+                                        topk,
+                                        dtype=torch.int32,
+                                        device=hidden_states.device)
+
+    ops.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),  # TODO(woosuk): Optimize this.
+    )
+    del token_expert_indicies  # Not used. Will be used in the future.
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids
+
+def get_default_config(
+    M: int,
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+) -> Dict[str, int]:
+    config = {
+        'BLOCK_SIZE_M': 64,
+        'BLOCK_SIZE_N': 64,
+        'BLOCK_SIZE_K': 32,
+        'GROUP_SIZE_M': 8
+    }
+    # A heuristic: fused marlin works faster with this config for small M
+    if M <= E or M <= 32:
+        config = {
+            'BLOCK_SIZE_M': 16,
+            'BLOCK_SIZE_N': 32,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 1
+        }
+    return config
+
+def try_get_optimal_moe_config(
+    w1_shape: Tuple[int, ...],
+    w2_shape: Tuple[int, ...],
+    top_k: int,
+    M: int,
+):
+    E, _, N = w2_shape
+    config = get_default_config(M, E, N, w1_shape[2], top_k, )
+    return config 
+
+def moe_align_block_size(
+        topk_ids: torch.Tensor, block_size: int,
+        num_experts: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Aligns the token distribution across experts to be compatible with block
+    size for matrix multiplication.
+
+    Parameters:
+    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
+        top-k expert indices for each token.
+    - block_size: The block size used in block matrix multiplication.
+    - num_experts: The total number of experts.
+
+    Returns:
+    - sorted_token_ids: A tensor containing the sorted token indices according
+        to their allocated expert.
+    - expert_ids: A tensor indicating the assigned expert index for each block.
+    - num_tokens_post_padded: The total number of tokens after padding,
+        ensuring divisibility by block_size.
+
+    This function pads the number of tokens that each expert needs to process
+    so that it is divisible by block_size.
+    Padding ensures that during block matrix multiplication, the dimensions
+    align correctly.
+
+    Example:
+    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+    block_size = 4, and num_experts = 4:
+    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
+        with each expert needing to process 3 tokens.
+    - As block_size is 4, we pad 1 token for each expert.
+    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
+    - Then append padding tokens [12, 12, 12, 12] for each block.
+    - After sorting by expert index, we obtain token_ids
+        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+        Tokens 12 are non-existent (padding) and are ignored in
+        the subsequent matrix multiplication.
+    - The padding ensures that the total number of tokens is now divisible
+        by block_size for proper block matrix operations.
+    """
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.empty((max_num_tokens_padded, ),
+                             dtype=torch.int32,
+                             device=topk_ids.device)
+    sorted_ids.fill_(topk_ids.numel())
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty((max_num_m_blocks, ),
+                             dtype=torch.int32,
+                             device=topk_ids.device)
+    num_tokens_post_pad = torch.empty((1),
+                                      dtype=torch.int32,
+                                      device=topk_ids.device)
+    ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
+                             expert_ids, num_tokens_post_pad)
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
+                            A_scale: Optional[torch.Tensor],
+                            B_scale: Optional[torch.Tensor],
+                            topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+                            sorted_token_ids: torch.Tensor,
+                            expert_ids: torch.Tensor,
+                            num_tokens_post_padded: torch.Tensor,
+                            mul_routed_weight: bool, top_k: int,
+                            config: Dict[str, Any], compute_type: tl.dtype,
+                            use_fp8_w8a8: bool, use_int8_w8a16: bool) -> None:
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    if use_fp8_w8a8:
+        A, A_scale = ops.scaled_fp8_quant(A, A_scale)
+        assert B_scale is not None
+    elif use_int8_w8a16:
+        assert B_scale is not None
+    else:
+        assert A_scale is None
+        assert B_scale is None
+
+    grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META[
+        'BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
+
+    fused_moe_kernel[grid](
+        A,
+        B,
+        C,
+        A_scale,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.shape[1],
+        B.shape[2],
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        B_scale.stride(0) if B_scale is not None and use_int8_w8a16 else 0,
+        B_scale.stride(1) if B_scale is not None and use_int8_w8a16 else 0,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        **config,
+    )
+
+def fused_experts(hidden_states: torch.Tensor,
+                       w1: torch.Tensor,
+                       w2: torch.Tensor,
+                       topk_weights: torch.Tensor,
+                       topk_ids: torch.Tensor,
+                       use_fp8_w8a8: bool = False,
+                       use_int8_w8a16: bool = False,
+                       w1_scale: Optional[torch.Tensor] = None,
+                       w2_scale: Optional[torch.Tensor] = None,
+                       a1_scale: Optional[torch.Tensor] = None,
+                       a2_scale: Optional[torch.Tensor] = None):
+    # Check constraints.
+    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+    assert hidden_states.dtype in [
+        torch.float32, torch.float16, torch.bfloat16
+    ]
+
+    num_tokens, _ = hidden_states.shape
+    E, N, _ = w1.shape
+    # We execute the fused_moe kernel in chunks to circumvent this issue:
+    # https://github.com/vllm-project/vllm/issues/5938
+    CHUNK_SIZE = 64 * 1024 
+    M = min(num_tokens, CHUNK_SIZE)
+
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w1.shape,
+        w2.shape,
+        topk_ids.shape[1],
+    )
+
+    config = get_config_func(M)
+
+    intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+    intermediate_cache2 = torch.empty((M * topk_ids.shape[1], N // 2),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+    intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+
+    compute_type = (tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16)
+
+    out_hidden_states = hidden_states
+
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
+                                          min((chunk + 1) * CHUNK_SIZE,
+                                              num_tokens))
+        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+        tokens_in_chunk, _ = curr_hidden_states.shape
+
+        if tokens_in_chunk == 0:
+            break
+
+        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+            # Adjust the intermediate cache size and config for the last
+            # chunk. Note that in most cases we only have one chunk
+            # so the cache size and config are already set correctly and
+            # do not need to be adjusted.
+            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk]
+            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+            config = get_config_func(tokens_in_chunk)
+
+        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
+
+        invoke_fused_moe_kernel(curr_hidden_states,
+                                w1,
+                                intermediate_cache1,
+                                a1_scale,
+                                w1_scale,
+                                curr_topk_weights,
+                                curr_topk_ids,
+                                sorted_token_ids,
+                                expert_ids,
+                                num_tokens_post_padded,
+                                False,
+                                topk_ids.shape[1],
+                                config,
+                                compute_type=compute_type,
+                                use_fp8_w8a8=use_fp8_w8a8,
+                                use_int8_w8a16=use_int8_w8a16)
+
+        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+
+        invoke_fused_moe_kernel(intermediate_cache2,
+                                w2,
+                                intermediate_cache3,
+                                a2_scale,
+                                w2_scale,
+                                curr_topk_weights,
+                                curr_topk_ids,
+                                sorted_token_ids,
+                                expert_ids,
+                                num_tokens_post_padded,
+                                True,
+                                1,
+                                config,
+                                compute_type=compute_type,
+                                use_fp8_w8a8=use_fp8_w8a8,
+                                use_int8_w8a16=use_int8_w8a16)
+
+        ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx])
+    return out_hidden_states
+
+def fused_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    This function computes a Mixture of Experts (MoE) layer using two sets of
+    weights, w1 and w2, and top-k gating mechanism.
+
+    Parameters:
+    - hidden_states (torch.Tensor): The input tensor to the MoE layer.
+    - w1 (torch.Tensor): The first set of expert weights.
+    - w2 (torch.Tensor): The second set of expert weights.
+    - gating_output (torch.Tensor): The output of the gating operation
+        (before softmax).
+    - topk (int): The number of top-k experts to select.
+    - renormalize (bool): If True, renormalize the top-k weights to sum to 1.
+    - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
+        products for w1 and w2. Defaults to False.
+    - use_int8_w8a16 (bool): If True, use fp8 arithmetic to compute the inner
+        products for w1 and w2. Defaults to False.
+    - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
+        w1.
+    - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
+        w2.
+
+    Returns:
+    - torch.Tensor: The output tensor after applying the MoE layer.
+    """
+    # Check constraints.
+    assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
+    topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk, renormalize)
+    return fused_experts(hidden_states,
+                         w1,
+                         w2,
+                         topk_weights,
+                         topk_ids,
+                         use_fp8_w8a8=use_fp8_w8a8,
+                         use_int8_w8a16=use_int8_w8a16,
+                         w1_scale=w1_scale,
+                         w2_scale=w2_scale,
+                         a1_scale=a1_scale,
+                         a2_scale=a2_scale)    

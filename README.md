@@ -27,6 +27,7 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 # 1. unit test 
 python3 unit_test/test_matmul.py 
 python3 unit_test/test_fusedattn.py 
+
 # 2. bench perf 
 python3 benchmark/bench_matmul.py 
 python3 benchmark/bench_fusedattn.py
