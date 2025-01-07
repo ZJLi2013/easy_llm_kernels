@@ -1,35 +1,54 @@
 import pytest 
 import torch 
+import triton 
+import triton.language as tl 
 from kernels import fused_moe_kernel 
 from utils import DEVICE 
 
-@pytest.mark.parametrize("TOKENS, EXPERTS, HIDDEN_SIZE, TOP_K ", [(32, 16, 128, 2)])
-def test_op(tokens, experts, hidden_size, topk, dtype=torch.float16, use_fp8_w8a8: bool=False, use_int8_w8a16: bool=False, ):
+BLOCK_SIZE_M=16
+
+@pytest.mark.parametrize("TOKENS, EXPERTS, INTERMEDIATE_SIZE, HIDDEN_SIZE, TOP_K ", [(32, 16, 128, 128, 2)])
+def test_op(tokens, experts, intermediate_size, hidden_size, topk, dtype=torch.float16, use_fp8_w8a8: bool=False, use_int8_w8a16: bool=False, ):
     torch.manual_seed(20)
-    A = (torch.empty((tokens, hidden_size), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))   # activation 
-    B = (torch.empty((experts, hidden_size, hidden_size), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)) # weight 
-    C = (torch.empty((experts, hidden_size), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
-    topk_weights = torch.empty((tokens, topk), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
-    topk_ids = torch.randint(0, experts, (tokens, topk), dtype=torch.int32, device=DEVICE)
-    sorted_token_ids = torch.argsort(torch.randint(0, tokens, (tokens,), device=DEVICE))
-    expert_ids = torch.randint(0, experts, (tokens,), dtype=torch.int32, device=DEVICE)
-    num_tokens_post_padded = torch.tensor([tokens], dtype=torch.int32, device=DEVICE)
+    # test as upper proj
+    # 0. dummy weights for A, B, C 
+    A = (torch.empty((tokens, hidden_size), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))   # input/activation
+    B = (torch.empty((experts, 2*intermediate_size, hidden_size), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)) # weights  
+    C = (torch.empty((tokens, experts, 2*intermediate_size), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    # 2. dummy topk weights and expert idx per token 
+    # topk_weights[tokens, topk] as topk route_logits per token; topk_ids[tokens, topk] as topk expert idx per token 
+    router_logits = torch.randn((tokens, experts), dtype=dtype, device=DEVICE)
+    routing_probs = torch.softmax(router_logits, dim=-1)
+    topk_weights, topk_ids = torch.topk(routing_probs, k=topk, dim=-1)
+    # 3. dummy sorted_token_ids for token alignment and expert_ids for grouping <== sort tokens based on their assigned experts
+    expert_ids = topk_ids.flatten()  #  Flatten topk_ids to group tokens by experts [tokens * top_k]
+    sorted_token_ids = (torch.arange(tokens, device=DEVICE).unsqueeze(-1).expand_as(topk_ids)).flatten()
+    _, sorted_indices = torch.sort(expert_ids)
+    sorted_token_ids = sorted_token_ids[sorted_indices] # [tokens * topk]
+    expert_ids = expert_ids[sorted_indices]  # [tokens * topk]
+    # 4. total num of tokens per expert, including padding for alignment 
+    tokens_per_expert = torch.bincount(expert_ids, minlength=experts)
+    num_tokens_post_padded = torch.ceil(tokens_per_expert.float() / BLOCK_SIZE_M).int() * BLOCK_SIZE_M  # [experts]
+
+    A_scale=None
+    B_scale=None 
 
     if use_fp8_w8a8 or use_int8_w8a16 :
-        dtype = torch.float8_e4m3 
         A_scale = torch.empty((tokens, ), dtype=dtype, deivce=DEVICE)
         B_scale = torch.empty((experts, ), dtype=dtype, device=DEVICE)
     else:
         assert A_scale is None
         assert B_scale is None
 
-    compute_type = dtype 
+    compute_type = tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
     mul_routed_weight=True 
 
-    custom_config = {
-    }
-    
-    fused_moe_kernel(A, B, C, A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
+    # configs = triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1}, )
+    configs = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1}
+    grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META['BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
+    print(f"{grid}")
+
+    fused_moe_kernel[grid](A, B, C, A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
                     B.shape[1],
                     B.shape[2],
                     sorted_token_ids.shape[0],
@@ -48,8 +67,13 @@ def test_op(tokens, experts, hidden_size, topk, dtype=torch.float16, use_fp8_w8a
                     compute_type=compute_type,
                     use_fp8_w8a8=use_fp8_w8a8,
                     use_int8_w8a16=use_int8_w8a16,
-                    **custom_config,)
+                    **configs,)
 
+
+if __name__=="__main__":
+    test_op(32, 16, 128, 128, 2)
+    print(f"test done")
+    #TODO: accuracy verify 
 
 
 

@@ -45,14 +45,11 @@ def fused_moe_kernel(
         stride_bn,
         stride_cm,
         stride_cn,
-        stride_asm,
-        stride_ask,
         stride_bse,
-        stride_bsk,
         stride_bsn,
-        # Block size for block-wise quantization
-        group_n: tl.constexpr,
-        group_k: tl.constexpr,
+        # # Block size for block-wise quantization
+        # group_n: tl.constexpr,
+        # group_k: tl.constexpr,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
