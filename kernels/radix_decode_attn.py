@@ -516,14 +516,14 @@ def _decode_grouped_att_m_fwd(
 
 @triton.jit
 def _fwd_kernel_stage2(
-    Mid_O, # (H_Q, total_num_tokens)
-    O, # (B, H_Q, D)
-    kv_indptr,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
-    stride_obs,
-    stride_oh,
+    Mid_O, # [bs, num_heads, num_chunks, chunk_size, kv_seqlen]
+    O, # [bs, num_heads, seqlen, D]
+    kv_indptr, 
+    stride_mid_ob, # bs stride in mid_o:  num_heads * seqlen * D
+    stride_mid_oh, # nheads stride in mid_o:  seqlen * D 
+    stride_mid_os, # stride along chunk_idx in mid_o = chunk_size * D
+    stride_obs, # bs stride in o: num_heads* seqlen * D
+    stride_oh, # nheads stride in o: seqlen * D 
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -533,7 +533,7 @@ def _fwd_kernel_stage2(
 
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
         kv_indptr + cur_batch
-    )
+    ) # kv_indptr[cur_batch+1] - kv_indptr[cur_batch] 
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -541,6 +541,10 @@ def _fwd_kernel_stage2(
     e_sum = 0.0
     e_max = -float("inf")
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    """
+        TODO: looks softmax do twice, in both stage1 & stage2 ??
+    """
 
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
@@ -573,10 +577,10 @@ def _fwd_kernel_stage2(
 
 
 def _decode_softmax_reducev_fwd(
-    logits,
-    q,
-    o,
-    v_buffer,
+    logits, # [bs, num_heads, seqlen, kv_seqlen]
+    q, # [bs, num_heads, seqlen, head_dim(D)]
+    o, # [bs, num_heads, seqlen, D]
+    v_buffer, # [bs, num_kv_heads, kv_seqlen, D]
     kv_indptr,
     num_kv_splits,
 ):
@@ -592,7 +596,7 @@ def _decode_softmax_reducev_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    grid = (batch, head_num)
+    grid = (batch, head_num) # pi.block along grid[0]-x 处理 batch; pi.block along grid[1]-y 处理 head_num   
     _fwd_kernel_stage2[grid]( # for softmax + reduce 
         logits,
         o,
@@ -643,7 +647,7 @@ def decode_attention_fwd_grouped(
     v_buffer,  # same as k_buffer
     o, # [bs, num_heads, seq_len, head_dim]
     kv_indptr,  # [bs + 1] , array in prefix sum style
-    kv_indices, # TODO: [max_tot_num_tokens, num_heads, head_dim] ?
+    kv_indices, # 所有chunk上 kvcache slots 
     attn_logits, # [bs, num_heads, seq_len, kv_seq_len]
     num_kv_splits, # kv-cache 的 chunks 数目
     sm_scale, 
