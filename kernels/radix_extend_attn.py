@@ -77,16 +77,16 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
 ):
-    cur_seq = tl.program_id(0)
-    cur_head = tl.program_id(1)
+    cur_seq = tl.program_id(0) #  grid 定义是 [bs, nhead, nblock]。batch 中每条就是 cur_seq 
+    cur_head = tl.program_id(1) 
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
 
-    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
-    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
-    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq) 
+    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx # extend_q 
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq) # kv_indptr[cur_seq]  
     cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
-    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend # kv cache for preill 
 
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_offsets + cur_seq)
@@ -108,6 +108,10 @@ def _fwd_kernel(
     q = tl.load(
         Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
     )
+    """
+        offs_q =  [BLOCK_M, 1] * stride_qbs + cur_head * stride_qh + offs_d[1, BLOCK_DMODEL]
+        q shape 与 off_q 一致： [BLOCK_M, BLOCK_DMODEL]
+    """
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -119,19 +123,19 @@ def _fwd_kernel(
         )
         qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
-    # stage 1: compute scores with prefix
+    # stage 1: compute scores with prefix 。计算 prefix 部分的 attn
     offs_n = tl.arange(0, BLOCK_N)
 
     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    for start_n in range(0, cur_seq_len_prefix, BLOCK_N): # cur_seq_len_prefix 按 BLOCK_N tokens 分到 chunks 中
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
         offs_kv_loc = tl.load(
             kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
-        )
+        )   # offs_kv_loc 中  BLOCK_N 个 token 的 首地址
 
         # load k in transposed way
         offs_buf_k = (
@@ -139,11 +143,15 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_kh
             + offs_d[:, None]
         )
+        """
+            offs_buf_k = offs_kv_loc[1, BLOCK_N] * stride_buf_kbs + .. + offs_d[BLOCK_DMODEL, 1]
+            buf_k 与 offs_buf_k shape 一致: [BLOCK_DMODEL, BLOCK_N]
+        """
         k = tl.load(
             K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
         )
 
-        qk = tl.dot(q.to(k.dtype), k)
+        qk = tl.dot(q.to(k.dtype), k) # qk[BLOCk_M, BLOCK_N] = q[BLOCK_M, BLOCK_DMODEL] * k[BLOCK_DMODEL, BLOCK_N]
         if BLOCK_DPE > 0:
             offs_kpe = (
                 offs_kv_loc[None, :] * stride_buf_kbs
@@ -189,15 +197,19 @@ def _fwd_kernel(
         v = tl.load(
             V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
+        """
+            offs_buf_v = offs_kv_loc[BLOCK_N, 1] * stride_buf_vbs + .. + offs_dv[1, BLOCK_DV]
+            v 与 offs_buf_v shape 一致：[BLOCK_N, BLOCK_DV]
+        """
         p = p.to(v.dtype)
-        acc = acc * re_scale[:, None] + tl.dot(p, v)
+        acc = acc * re_scale[:, None] + tl.dot(p, v)  # acc[BLOCK_M, BLOCK_DV] = p[BLOCk_M, BLOCK_N] * v[BLOCK_N, BLOCK_DV]
 
         e_max = n_e_max
 
-    # stage 2: compute the triangle part
+    # stage 2: compute the triangle part。计算 extend 部分的 attn
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
+    for start_n in range(0, cur_block_m_end, BLOCK_N): # cur_seq_len_extend 按 BLOCK_N tokens 分到 chunks 中
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -210,8 +222,16 @@ def _fwd_kernel(
         k = tl.load(
             K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
         )
-
-        qk = tl.dot(q, k, out_dtype=tl.float32)
+        """
+            offs_k = (.. + offs_n[1, BLOCK_N]) * stride_kbs + .. + offs_d[BLOCK_DMODEL, 1] 
+            k 与 offs_k shape 一致:  [BLOCK_DMODEL, BLOCK_N]
+        """
+        qk = tl.dot(q, k, out_dtype=tl.float32) 
+        """
+            同样的q tensor, 但是与 extend k tensor 做 attn 计算 
+            extend_qk[BLOCK_M, BLOCK_N] = q[BLOCK_M, BLOCK_DMODEL] * k[BLOCK_DMODEL, BLOCK_N]
+            即 extend的计算，与 prefix 的计算使用了同样的 block_size for DMODEL, M, N
+        """
         if BLOCK_DPE > 0:
             offs_kpe = (
                 (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
@@ -263,9 +283,16 @@ def _fwd_kernel(
         v = tl.load(
             V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
         )
+        """
+            offs_v = (.. + offs_n[BLOCK_N, 1]) * stride_vbs + .. + offs_dv[1, BLOCK_DV]
+            v 与 offs_v 同shape:  [BLOCK_N, BLOCK_DV]
+        """
         p = p.to(v.dtype)
-        acc = acc * re_scale[:, None] + tl.dot(p, v)
-
+        acc = acc * re_scale[:, None] + tl.dot(p, v)  
+        """
+            注意，这里 acc 已经叠加了 prefix attn 的计算结果
+            extend_acc[BLOCK_M, BLOCK_DV] = p[BLOCK_M, BLOCK_N] * v[BLOCK_N, BLOCK_DV]
+        """
         e_max = n_e_max
 
     offs_o = (
@@ -277,33 +304,42 @@ def _fwd_kernel(
     tl.store(
         O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
     )
+    """
+        offs_o = (.. + offs_m[BLOCK_M, 1]) * stride_obs + .. + offs_dv[1, BLOCK_DV]，与 acc shape 一致
+    """
 
 
 def extend_attention_fwd(
-    q_extend,
-    k_extend,
-    v_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    custom_mask,
+    q_extend,  # [extend_token_num, head_num,  head_dim(D)]
+    k_extend,  # [extend_token_num, kv_head_num, D]
+    v_extend,  # [extend_token_num, kv_head_num, D] 
+    o_extend,  # [max_token_num, head_num, D] # TODO 
+    k_buffer,  # 保存 prefix 部分的 k buffer [max_token_num, kv_head_num, head_dim(D)]
+    v_buffer,  # 保存 prefix 部分的 v buffer [max_token_num, kv_head_num, D] 
+    qo_indptr, # [bs+1], array in prefix sum style 
+    kv_indptr,  # [bs + 1] , array in prefix sum style
+    kv_indices, # 所有chunk上 kvcache slots
+    custom_mask, 
     mask_offsets,
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
 ):
     """
-    q_extend, k_extend, v_extend, o_extend: contiguous tensors
+    https://xdkkkgyt8c.feishu.cn/wiki/LrPowtneFiAwdmkt4zjcYuqQnye
+    Extend Attention 和普通 Prefill 阶段的 Attention 算子的区别：
+        1. 在 Extend 阶段（相当于正常情况的 Prefill 阶段），一条 Request 的 Prefix 部分已经有 KV Cache，保存在 K_Buffer/V_Buffer 中
+        2. Extend 阶段输入的 input_ids 只有 extend 部分的 Token, 所以在计算 Attention 时，输入值是 extend 部分的 token 的 QKV(Q_Extend/K_Extend/V_Extend), prefix 部分的 token 会复用 K_Buffer/V_Buffer
+        3. Extend 阶段的输出也是只有 extend 部分的 Token 对应的 hidden_states
 
+    q_extend, k_extend, v_extend, o_extend: contiguous tensors
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+
     """
     Lq, Lk, Lv = (
-        q_extend.shape[-1],
-        k_extend.shape[-1],
-        v_extend.shape[-1],
+        q_extend.shape[-1], # q_head_dim
+        k_extend.shape[-1], # k_head_dim
+        v_extend.shape[-1], # v_head_dim 
     )
 
     if Lq == 576:
@@ -341,6 +377,14 @@ def extend_attention_fwd(
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
         num_warps = 4 if Lk <= 64 else 8
+    
+    """
+        * BLOCK_DMODEL: per tl.block handle the size from head_dim 
+        * BLOCK_DPE: per tl.block handle the size from Postional Encoding 
+        * BLOCK_DV: power 2 most close to V_head_dim , per tl.block handle the size from v head_dim 
+        * BLOCK_N: per tl.block handle the size from kv_heads  
+        * BLOCK_M: per tl.block handle the size from bs * q_heads
+    """
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -349,6 +393,11 @@ def extend_attention_fwd(
     USE_CUSTOM_MASK = custom_mask is not None
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    """
+        tl.block along grid-0: bs 
+        tl.block along grid-1: head_num
+        tl.block along grid-2: 处理 bs*heads 中 ith 分组, 每个 tl.block 处理 BLOCK_M 个 heads 
+    """
     num_stages = 1
 
     extra_kargs = {}
@@ -369,17 +418,17 @@ def extend_attention_fwd(
         mask_offsets,
         sm_scale,
         kv_group_num,
-        q_extend.stride(0),
-        q_extend.stride(1),
-        k_extend.stride(0),
-        k_extend.stride(1),
-        v_extend.stride(0),
-        v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
+        q_extend.stride(0),  # head_num * D 
+        q_extend.stride(1),  # D
+        k_extend.stride(0),  # kv_head_num * D
+        k_extend.stride(1),  # D
+        v_extend.stride(0),  # kv_head_num * D
+        v_extend.stride(1),  # D 
+        o_extend.stride(0),  # head_num * D
+        o_extend.stride(1),  # D 
+        k_buffer.stride(0),  # kv_head_num * D 
+        k_buffer.stride(1),  # D 
+        v_buffer.stride(0),  # kv_head_num * D 
         v_buffer.stride(1),
         logit_cap=logit_cap,
         BLOCK_DMODEL=BLOCK_DMODEL,
