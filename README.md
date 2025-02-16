@@ -4,7 +4,7 @@ a collection of workable triton kernels(NV & AMD GPUs) for building fast llm inf
 
 1. MatMul normal, & matmul with per-channel/per-tensor/blockwise scaling for int8/fp8 
 2. MoE with bf16, int8, fp8 
-3. FlashAttn-v2, RadixDecodeAttn, RadixExtendAttn, PagedAttn, LinearAttn 
+3. FlashAttn-v2, PagedAttn, RadixDecodeAttn, RadixExtendAttn, PrefillAttn, LinearAttn 
 
 
 
