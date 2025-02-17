@@ -1,5 +1,4 @@
 # vllm prefix_prefill_attn:  https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/prefix_prefill.py
-# vllm prefix_prefill_attn zhihu:  https://zhuanlan.zhihu.com/p/695799736
 # sglang prefill_attn https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/triton_ops/prefill_attention.py
 
 @triton.jit
@@ -9,14 +8,14 @@ def _fwd_kernel(
     V,
     K_cache, # [num_blocks, num_kv_heads, head_size/x, block_size, x]
     V_cache, # [num_blocks, num_kv_heads, head_size, block_size]
-    B_Loc, # [B, S, ?] 所有 chunks 上的 kv_locs 
+    B_Loc, # block_table, TODO [B, num_blocks, num_heads, head_size, block_size] ，多了batch 维度 ??
     sm_scale,
     k_scale,
     v_scale,
-    B_Start_Loc, # b_loc 的所有 起始指针 
+    B_Start_Loc, # TODO: b_loc 的所有 起始指针 
     B_Seqlen,  # batch total seqLen
     B_Ctxlen,  # batch total ctxLen
-    block_size, # 
+    block_size, 
     x,
     Out, # [B, H_q, seqlen, qk_hd] --> [B, H_q, num_chunks, chun_size(BLOCK_N), qk_hd]
     stride_b_loc_b, #b_loc.stride[0], 
@@ -27,13 +26,13 @@ def _fwd_kernel(
     stride_kbs,
     stride_kh,
     stride_kd,
-    stride_vbs,
+    stride_vbs, # num_kv_heads * head_size * block_size 
     stride_vh,
     stride_vd,
     stride_obs,
     stride_oh,
     stride_od,
-    stride_k_cache_bs,
+    stride_k_cache_bs, #[bs, h, d, bl, x] :: [num_blocks, num_kv_heads, head_size/x, block_size, x]  注意这里的缩写字母定义跟理解有些不一致
     stride_k_cache_h,
     stride_k_cache_d,
     stride_k_cache_bl,
@@ -52,7 +51,7 @@ def _fwd_kernel(
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    start_m = tl.program_id(2)
+    start_m = tl.program_id(2)  # index along mblock dim
 
     cur_kv_head = cur_head // num_queries_per_kv
 
@@ -88,7 +87,7 @@ def _fwd_kernel(
 
     """
         off_q [BLOCK_M, BLOCK_DMODEL_PADDED]
-        q[BLOCK_M, BLOCK_DMODEL_PADDED]
+        q same shape as off_q 
     """
 
     # initialize pointer to m and l
@@ -109,10 +108,17 @@ def _fwd_kernel(
             bn [BLOCK_N]
             * k_cache [num_blocks, num_kv_heads, head_size/x, block_size, x]
             * v_cache [num_blocks, num_kv_heads, head_size, block_size]
-            * TODO: radix_decode_attn 中 k_cache : [ bs, H_kv, num_blocks, block_size, qk_head_dim], v_cache [bs, H_kv, num_blocks, block_size, v_head_dim], 理解有误 ?
+            * TODO: 注意貌似 radix_decode_attn 中 k_cache : [ bs, H_kv, num_blocks, block_size, qk_head_dim], v_cache [bs, H_kv, num_blocks, block_size, v_head_dim]
             
-            * b_loc [B, num_blocks, ?] 
-            * B_Start_Loc 则是上述 B_loc， num_blocks 维度的首地址
+            * 理解下 b_loc 的tensor shape  
+                * b_loc(block_table) 考虑bs 一般shape为 [B, max_blocks_per_seq]，然后通过 seq_id, token_id 查询: block_id 及 block_offset:
+                    * block_id = block_table[seq_id][token_id//block_size]
+                    * block_offset = token_id % block_size
+                * 不过这里 b_loc 还有 num_blocks 维度, 结合下文 off_k, off_v 访问，其shape大概是 [B, num_blocks, num_heads, head_size, block_size] 
+                    * block_id = (start_n + offs_n)//block_size 
+                    * bn = B_loc + seq_id * stride_b_loc_b + block_id * strid_b_loc_s # per bs, per block 下的 tensor 首地址
+                * 与 radix_decode_attn 中 kvcache 的区别就是, num_blocks/block_size vs num_heads/head_size 内存排布的顺序
+                    * 应该讲， num_blocks 排布在更外层，对于kvcache动态增长更显存友好。 
         """
         # [D,N]
         off_k = (bn[None, :] * stride_k_cache_bs +
@@ -122,7 +128,11 @@ def _fwd_kernel(
                     stride_k_cache_bl +
                     (offs_d[:, None] % x) * stride_k_cache_x)
         """
+            k_cache  [num_blocks, num_kv_heads, head_size/x, block_size, x]
+            stride_k_cache_bs= num_kv_heads * head_size * local_block_size ==> block_size 应该仍然是以 tokens 计数
+                1. 注意，bs 这里是 num_blocks 维度，所以 bn 应该也是 B_Loc num_blocks 维度的切分 
 
+            off_k [BLOCK_DMODEL_PADDED, BLOCK_N] # [D, N]
         """
         # [N,D]
         off_v = (
@@ -134,6 +144,12 @@ def _fwd_kernel(
                             mask=dim_mask[:, None] &
                             ((start_n + offs_n[None, :]) < cur_batch_ctx_len),
                             other=0.0)  # [D,N]
+        """
+            v_cache [num_blocks, num_kv_heads, head_size, block_size]
+            off_v [BLOCK_N, BLOCK_DMODEL_PADDED] # [N, D]
+            
+            k_load same shape as off_k 
+        """
 
         if k_load.dtype.is_fp8():
             k = (k_load.to(tl.float32) * k_scale).to(q.dtype)
@@ -142,6 +158,12 @@ def _fwd_kernel(
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)  # [M,N]
         qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
+        """
+            qk [BLOCK_M, BLOCK_N] # [M, N]
+            q [BLOCK_M, BLOCK_DMODEL_PADDED]
+            k [BLOCK_DMODEL_PADDED, BLOCK_N]
+
+        """
         qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
                         float("-inf"))
         qk *= sm_scale
@@ -177,12 +199,17 @@ def _fwd_kernel(
         p = p * p_scale[:, None]
         # scale acc
         acc_scale = l_i / l_i_new * alpha
-        acc = acc * acc_scale[:, None]
+        acc = acc * acc_scale[:, None]   # same shape as qk [M, N]
         # update acc
         v_load = tl.load(V_cache + off_v,
                             mask=dim_mask[None, :] &
                             ((start_n + offs_n[:, None]) < cur_batch_ctx_len),
                             other=0.0)  # [N,D]
+        """
+            off_v [BLOCK_N, BLOCK_DMODEL_PADDED] # [N, D]
+            v_load same shape as off_v 
+
+        """
         if v_load.dtype.is_fp8():
             v = (v_load.to(tl.float32) * v_scale).to(q.dtype)
         else:
@@ -194,31 +221,52 @@ def _fwd_kernel(
         l_i = l_i_new
         m_i = m_i_new
 
+    # 注意，context_attn 还是有 pre-cached 和 raw tensors 部分。前面从 kv_cache 里面读的是 pre-cached 
     off_k = (offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh +
                 offs_d[:, None] * stride_kd)
     off_v = (offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh +
                 offs_d[None, :] * stride_vd)
     k_ptrs = K + off_k
     v_ptrs = V + off_v
+    """
+        off_k [BLOCK_DMODEL_PADDED,  BLOCK_N] -> same shape for k_ptrs
+        off_v [BLOCK_N, BLOCK_DMODEL_PADDED] -> same shape for v_ptrs 
+    """
 
     # block_mask is 0 when we're already past the current query length
-    block_mask = tl.where(block_start_loc < cur_batch_query_len, 1, 0)
+    block_mask = tl.where(block_start_loc < cur_batch_query_len, 1, 0) 
+    """
+       block_start_loc 为张量,  cur_batch_query_len 为标量
+       对于 block_start_loc 中元素小于 cur_batch_query_len 的元素 其mask=1 ; 否则 mask=0 
+       
+       整个contxt_attn 的计算 == cross_attn on cached_kv + self_att on input query based 
+                             == [query, cached_k, cached_v ]  + [query, queryed_k(K), queryed_v(V)]
+    """ 
 
     # compute query against itself (with causal mask)
     for start_n in range(0, block_mask * (start_m + 1) * BLOCK_M, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+        """
+            start_m 沿M(seq_len) 方向，每个 tl.block 处理 BLOCK_M 个 tokens，每次处理 沿着 kv 方向的 BLOCK_N 个元素 
+            tl.blocks 沿着 seqlen 方向排布，per cycle per tl.block 处理 [BLOCK_M, BLOCK_N] subsize, split kv 方向into xBLOCK_N
+        """
+        start_n = tl.multiple_of(start_n, BLOCK_N) #[BLOCK_N]
         # -- compute qk ----
         k = tl.load(k_ptrs +
                     (cur_batch_in_all_start_index + start_n) * stride_kbs,
                     mask=dim_mask[:, None] &
                     ((start_n + offs_n[None, :]) < cur_batch_query_len),
                     other=0.0)
+        """
+            per tl.block 处理 k_ptrs submatrix shape as [BLOCK_DMODEL_PADDED,  BLOCK_N] 
+            此时q 跟 cross-attn 计算的 q 是同一个:    q [BLOCK_M, BLOCK_DMODEL_PADDED]
+
+        """
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
+        qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)   # qk [BLOCK_M, BLOCK_N]
         qk *= sm_scale
         # apply causal mask
-        qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+        qk = tl.where( [:, None] >= (start_n + offs_n[None, :]), qk,
                         float("-inf"))
         if SLIDING_WINDOW > 0:
             qk = tl.where(
@@ -247,24 +295,28 @@ def _fwd_kernel(
                     mask=dim_mask[None, :] &
                     ((start_n + offs_n[:, None]) < cur_batch_query_len),
                     other=0.0)
+        """
+            v_ptrs [BLOCK_N, BLOCK_DMODEL_PADDED] 
+            p [BLOCK_M, BLOCK_N]
+            acc [BLOCK_M, BLOCK_DMODEL_PADDED]
+            off_o [BLOCK_M, BLOCK_DMODEL_PADDED]
+        """
         p = p.to(v.dtype)
 
-        acc = tl.dot(p, v, acc=acc, input_precision=IN_PRECISION)
+        acc = tl.dot(p, v, acc=acc, input_precision=IN_PRECISION)  # acc += p*v   
         # update m_i and l_i
         l_i = l_i_new
         m_i = m_i_new
     # initialize pointers to output
     off_o = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs +
-        cur_head * stride_oh + offs_d[None, :] * stride_od)
+        cur_head * stride_oh + offs_d[None, :] * stride_od) # [bs, num_blocks, num_heads, head_size]
     out_ptrs = Out + off_o
     tl.store(out_ptrs,
                 acc,
                 mask=dim_mask[None, :] &
                 (offs_m[:, None] < cur_batch_query_len))
     return
-
-
 
 
 @torch.inference_mode()
@@ -453,7 +505,7 @@ def context_attention_fwd(q,
     return
 
 
-
+# zhihu:  https://zhuanlan.zhihu.com/p/695799736
 @triton.jit
 def _fwd_kernel_alibi(
     Q, # new tokens对应的query Tensor
